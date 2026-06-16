@@ -1,0 +1,420 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+
+local theme = {background=Color3.fromRGB(18,18,26), accent=Color3.fromRGB(0,120,220), text=Color3.fromRGB(255,255,255), buttonBg=Color3.fromRGB(38,38,52), card=Color3.fromRGB(28,28,40)}
+
+local TYPE_COLORS = {
+    Instance = Color3.fromRGB(120,200,255),
+    Vector3 = Color3.fromRGB(255,180,80),
+    Vector2 = Color3.fromRGB(255,180,80),
+    CFrame = Color3.fromRGB(255,180,80),
+    Color3 = Color3.fromRGB(255,140,200),
+    EnumItem = Color3.fromRGB(120,220,180),
+    Boolean = Color3.fromRGB(255,120,120),
+    Number = Color3.fromRGB(255,210,90),
+    String = Color3.fromRGB(255,255,255),
+    Table = Color3.fromRGB(200,160,255),
+    Nil = Color3.fromRGB(140,140,140),
+}
+
+local CLASS_ICON = {RemoteEvent = "⚡", RemoteFunction = "ƒ", UnreliableRemoteEvent = "≈"}
+
+-- ============================================================
+-- helpers
+-- ============================================================
+local function corner(inst, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 6)
+    c.Parent = inst
+    return c
+end
+
+local function make(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props) do inst[k] = v end
+    if parent then inst.Parent = parent end
+    return inst
+end
+
+local function btn(parent, props)
+    local b = make("TextButton", props, parent)
+    b.Font = props.Font or Enum.Font.Gotham
+    b.TextColor3 = props.TextColor3 or theme.text
+    corner(b, 6)
+    return b
+end
+
+-- ============================================================
+-- CORE ENGINE: value formatting + call logging
+-- ============================================================
+local function formatValue(v)
+    local t = typeof(v)
+    if t == "Instance" then
+        local ok, full = pcall(function() return v:GetFullName() end)
+        return ok and full or tostring(v), "Instance"
+    elseif t == "Vector3" then
+        return string.format("%.3f, %.3f, %.3f", v.X, v.Y, v.Z), "Vector3"
+    elseif t == "Vector2" then
+        return string.format("%.3f, %.3f", v.X, v.Y), "Vector2"
+    elseif t == "CFrame" then
+        local p = v.Position
+        return string.format("%.2f, %.2f, %.2f", p.X, p.Y, p.Z), "CFrame"
+    elseif t == "Color3" then
+        return string.format("%d, %d, %d", math.floor(v.R*255), math.floor(v.G*255), math.floor(v.B*255)), "Color3"
+    elseif t == "EnumItem" then
+        return tostring(v), "EnumItem"
+    elseif t == "boolean" then
+        return tostring(v), "Boolean"
+    elseif t == "number" then
+        return tostring(v), "Number"
+    elseif t == "string" then
+        return v, "String"
+    elseif t == "table" then
+        local parts, n = {}, 0
+        for k, val in pairs(v) do
+            n = n + 1
+            if n > 6 then parts[#parts+1] = "..."; break end
+            local vs = formatValue(val)
+            parts[#parts+1] = tostring(k) .. "=" .. tostring(vs)
+        end
+        return "{" .. table.concat(parts, ", ") .. "}", "Table"
+    elseif v == nil then
+        return "nil", "Nil"
+    else
+        return tostring(v), t
+    end
+end
+
+local function parseValue(text, typeHint)
+    if typeHint == "Vector3" then
+        local x, y, z = text:match("([%-%d%.]+),%s*([%-%d%.]+),%s*([%-%d%.]+)")
+        if x then return Vector3.new(tonumber(x), tonumber(y), tonumber(z)) end
+    elseif typeHint == "Vector2" then
+        local x, y = text:match("([%-%d%.]+),%s*([%-%d%.]+)")
+        if x then return Vector2.new(tonumber(x), tonumber(y)) end
+    elseif typeHint == "Color3" then
+        local r, g, b = text:match("(%d+),%s*(%d+),%s*(%d+)")
+        if r then return Color3.fromRGB(tonumber(r), tonumber(g), tonumber(b)) end
+    elseif typeHint == "Boolean" then
+        return text == "true"
+    elseif typeHint == "Number" then
+        return tonumber(text) or 0
+    elseif typeHint == "Nil" then
+        return nil
+    end
+    return text
+end
+
+local logs = {Outgoing = {}, Incoming = {}}
+local MAX_CALLS_PER_REMOTE = 50
+local onNewCall = nil -- set later once UI exists, called as onNewCall(direction, remote)
+
+local function recordCall(direction, remote, rawArgs, scriptName)
+    local bucket = logs[direction]
+    local entry = bucket[remote]
+    if not entry then
+        entry = {count = 0, calls = {}, remote = remote}
+        bucket[remote] = entry
+    end
+    entry.count = entry.count + 1
+
+    local formatted = {}
+    for i, v in ipairs(rawArgs) do
+        local disp, typ = formatValue(v)
+        formatted[i] = {display = disp, typeLabel = typ, raw = v}
+    end
+
+    table.insert(entry.calls, 1, {args = formatted, time = os.date("%H:%M:%S"), script = scriptName or "unknown"})
+    if #entry.calls > MAX_CALLS_PER_REMOTE then table.remove(entry.calls) end
+
+    if onNewCall then onNewCall(direction, remote) end
+    return entry
+end
+
+local capturedRemoteClasses = {RemoteEvent = true, RemoteFunction = true, UnreliableRemoteEvent = true}
+
+local function getCallerName()
+    local ok, name = pcall(function()
+        if getcallingscript then
+            local s = getcallingscript()
+            return s and s.Name or "unknown"
+        end
+        return "unknown"
+    end)
+    return ok and name or "unknown"
+end
+
+local oldNamecall
+pcall(function()
+    local mt = getrawmetatable(game)
+    local canToggleReadonly = setreadonly ~= nil
+    if canToggleReadonly then setreadonly(mt, false) end
+
+    local ok = pcall(function()
+        oldNamecall = mt.__namecall
+        mt.__namecall = newcclosure(function(self, ...)
+            local method = getnamecallmethod()
+            if (method == "FireServer" or method == "InvokeServer") and capturedRemoteClasses[self.ClassName] then
+                recordCall("Outgoing", self, {...}, getCallerName())
+            end
+            return oldNamecall(self, ...)
+        end)
+    end)
+
+    if canToggleReadonly then setreadonly(mt, true) end
+    if not ok then error("namecall hook failed") end
+end)
+
+local hookedIncoming = {}
+local function hookIncoming(obj)
+    if hookedIncoming[obj] then return end
+    hookedIncoming[obj] = true
+    if obj:IsA("RemoteEvent") or obj:IsA("UnreliableRemoteEvent") then
+        obj.OnClientEvent:Connect(function(...) recordCall("Incoming", obj, {...}, "Server") end)
+    elseif obj:IsA("RemoteFunction") then
+        pcall(function()
+            local existing = obj.OnClientInvoke
+            obj.OnClientInvoke = function(...)
+                recordCall("Incoming", obj, {...}, "Server")
+                if existing then return existing(...) end
+            end
+        end)
+    end
+end
+
+local function scanForRemote(obj)
+    if capturedRemoteClasses[obj.ClassName] then hookIncoming(obj) end
+end
+for _, obj in ipairs(game:GetDescendants()) do scanForRemote(obj) end
+game.DescendantAdded:Connect(scanForRemote)
+
+local function fireRemote(remote, args)
+    args = args or {}
+    if remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") then
+        remote:FireServer(table.unpack(args))
+    elseif remote:IsA("RemoteFunction") then
+        remote:InvokeServer(table.unpack(args))
+    end
+end
+
+-- ============================================================
+-- UI SHELL
+-- ============================================================
+local gui = make("ScreenGui", {Name="EmphaseHub", ResetOnSpawn=false}, player:WaitForChild("PlayerGui"))
+
+local frame = make("Frame", {Size=UDim2.new(0,480,0,460), Position=UDim2.new(0,20,0,20), BackgroundColor3=theme.background}, gui)
+corner(frame, 8)
+
+local titleBar = make("Frame", {Size=UDim2.new(1,0,0,36), BackgroundColor3=theme.accent}, frame)
+corner(titleBar, 8)
+local titleLabel = make("TextLabel", {Size=UDim2.new(1,-44,1,0), Position=UDim2.new(0,8,0,0), BackgroundTransparency=1, Text="EmphaseHub Remote Debug", TextColor3=theme.text, TextXAlignment=Enum.TextXAlignment.Left, Font=Enum.Font.GothamBold, TextSize=16}, titleBar)
+local minimizeBtn = btn(titleBar, {Size=UDim2.new(0,32,0,28), Position=UDim2.new(1,-36,0,4), BackgroundColor3=theme.buttonBg, Text="_", Font=Enum.Font.GothamBold, TextSize=18})
+
+local body = make("Frame", {Size=UDim2.new(1,0,1,-36), Position=UDim2.new(0,0,0,36), BackgroundTransparency=1}, frame)
+local tabBar = make("Frame", {Size=UDim2.new(1,0,0,32), BackgroundTransparency=1}, body)
+
+local function makeTabBtn(text, x)
+    return btn(tabBar, {Size=UDim2.new(1/3,-2,1,0), Position=UDim2.new(x,x>0 and 2 or 0,0,0), BackgroundColor3=theme.buttonBg, Text=text, Font=Enum.Font.GothamBold, TextSize=14})
+end
+local remotesTabBtn = makeTabBtn("Remotes", 0)
+remotesTabBtn.BackgroundColor3 = theme.accent
+local liveTabBtn = makeTabBtn("Live", 1/3)
+local settingsTabBtn = makeTabBtn("Settings", 2/3)
+
+-- ============================================================
+-- REMOTES TAB (browse + fire any remote in ReplicatedStorage)
+-- ============================================================
+local remotesPage = make("Frame", {Size=UDim2.new(1,0,1,-36), Position=UDim2.new(0,0,0,36), BackgroundTransparency=1}, body)
+
+local scanBtn = btn(remotesPage, {Size=UDim2.new(1,0,0,28), BackgroundColor3=theme.buttonBg, Text="Scan Remotes", TextSize=14})
+
+local remotesSearchBox = make("TextBox", {Size=UDim2.new(1,0,0,28), Position=UDim2.new(0,0,0,32), BackgroundColor3=theme.buttonBg, TextColor3=theme.text, PlaceholderText="Search by name...", Text="", ClearTextOnFocus=false, Font=Enum.Font.Gotham, TextSize=13}, remotesPage)
+corner(remotesSearchBox, 6)
+
+local scrollFrame = make("ScrollingFrame", {Size=UDim2.new(1,0,1,-180), Position=UDim2.new(0,0,0,64), BackgroundTransparency=1, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=6}, remotesPage)
+make("UIListLayout", {Padding=UDim.new(0,2)}, scrollFrame)
+
+local intervalBox = make("TextBox", {Size=UDim2.new(1,0,0,30), Position=UDim2.new(0,0,1,-116), BackgroundColor3=theme.buttonBg, TextColor3=theme.text, PlaceholderText="Loop interval (sec, 0 = fastest)", Text="1", Font=Enum.Font.Gotham, TextSize=14}, remotesPage)
+corner(intervalBox, 6)
+local fireSelectedBtn = btn(remotesPage, {Size=UDim2.new(1,0,0,30), Position=UDim2.new(0,0,1,-80), BackgroundColor3=theme.buttonBg, Text="Fire Selected Once", TextSize=14})
+local copyBtn = btn(remotesPage, {Size=UDim2.new(1,0,0,30), Position=UDim2.new(0,0,1,-44), BackgroundColor3=theme.buttonBg, Text="Copy Path to Clipboard", TextSize=14})
+local loopBtn = btn(remotesPage, {Size=UDim2.new(1,0,0,30), Position=UDim2.new(0,0,1,-8), AnchorPoint=Vector2.new(0,1), BackgroundColor3=theme.accent, Text="Start Loop", Font=Enum.Font.GothamBold, TextSize=14})
+
+local selectedRemote, selectedRemoteBtn
+
+local function makeRemoteRow(parent, obj, onSelect)
+    local row = make("TextButton", {Size=UDim2.new(1,0,0,26), BackgroundColor3=theme.buttonBg, Text="", AutoButtonColor=false}, parent)
+    corner(row, 4)
+    make("TextLabel", {Size=UDim2.new(0,22,1,0), BackgroundTransparency=1, Text=CLASS_ICON[obj.ClassName] or "?", TextColor3=theme.accent, Font=Enum.Font.GothamBold, TextSize=14}, row)
+    make("TextLabel", {Size=UDim2.new(1,-26,1,0), Position=UDim2.new(0,24,0,0), BackgroundTransparency=1, Text=obj:GetFullName(), TextColor3=theme.text, Font=Enum.Font.Gotham, TextSize=12, TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd}, row)
+    row:SetAttribute("RemoteClass", obj.ClassName)
+    row:SetAttribute("RemoteName", obj:GetFullName():lower())
+    row.MouseButton1Click:Connect(function() onSelect(obj, row) end)
+    return row
+end
+
+local function applySearchFilter(scroll, searchBox)
+    local q = searchBox.Text:lower()
+    for _, row in ipairs(scroll:GetChildren()) do
+        if row:IsA("TextButton") then
+            local nm = row:GetAttribute("RemoteName") or ""
+            row.Visible = (q == "") or nm:find(q, 1, true) ~= nil
+        end
+    end
+end
+
+local function scanRemotes()
+    for _, c in ipairs(scrollFrame:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if capturedRemoteClasses[obj.ClassName] then
+            makeRemoteRow(scrollFrame, obj, function(o, row)
+                selectedRemote = o
+                if selectedRemoteBtn then selectedRemoteBtn.BackgroundColor3 = theme.buttonBg end
+                selectedRemoteBtn = row
+                row.BackgroundColor3 = theme.accent
+            end)
+        end
+    end
+    applySearchFilter(scrollFrame, remotesSearchBox)
+end
+
+remotesSearchBox:GetPropertyChangedSignal("Text"):Connect(function() applySearchFilter(scrollFrame, remotesSearchBox) end)
+scanBtn.MouseButton1Click:Connect(scanRemotes)
+fireSelectedBtn.MouseButton1Click:Connect(function() if selectedRemote then fireRemote(selectedRemote) end end)
+copyBtn.MouseButton1Click:Connect(function()
+    if selectedRemote then
+        local ok = pcall(function() setclipboard(selectedRemote:GetFullName()) end)
+        if not ok then print("Selected remote path: " .. selectedRemote:GetFullName()) end
+    end
+end)
+
+local function makeLoopHandler(loopButton, getSelected, getInterval)
+    local active = false
+    loopButton.MouseButton1Click:Connect(function()
+        local sel = getSelected()
+        if not sel then return end
+        if active then active = false; loopButton.Text = "Start Loop"; return end
+        active = true
+        loopButton.Text = "Stop Loop"
+        task.spawn(function()
+            while active do
+                fireRemote(getSelected())
+                local interval = getInterval()
+                task.wait(interval > 0 and interval or nil)
+            end
+        end)
+    end)
+end
+makeLoopHandler(loopBtn, function() return selectedRemote end, function() return math.max(tonumber(intervalBox.Text) or 1, 0) end)
+
+-- ============================================================
+-- LIVE TAB (Cobalt-style: Outgoing/Incoming -> remote list w/ counts -> call history -> edit & refire)
+-- ============================================================
+local livePage = make("Frame", {Size=UDim2.new(1,0,1,-36), Position=UDim2.new(0,0,0,36), BackgroundTransparency=1, Visible=false}, body)
+
+local liveSubTabBar = make("Frame", {Size=UDim2.new(1,0,0,28), BackgroundTransparency=1}, livePage)
+local outgoingTabBtn = btn(liveSubTabBar, {Size=UDim2.new(0.5,-2,1,0), BackgroundColor3=theme.accent, Text="Outgoing", TextSize=13})
+local incomingTabBtn = btn(liveSubTabBar, {Size=UDim2.new(0.5,-2,1,0), Position=UDim2.new(0.5,2,0,0), BackgroundColor3=theme.buttonBg, Text="Incoming", TextSize=13})
+
+-- Three stacked "screens" within the Live tab: list / history / edit. Only one visible at a time.
+local liveListScreen = make("ScrollingFrame", {Size=UDim2.new(1,0,1,-32), Position=UDim2.new(0,0,0,32), BackgroundTransparency=1, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=6}, livePage)
+make("UIListLayout", {Padding=UDim.new(0,3)}, liveListScreen)
+
+local liveHistoryScreen = make("Frame", {Size=UDim2.new(1,0,1,-32), Position=UDim2.new(0,0,0,32), BackgroundTransparency=1, Visible=false}, livePage)
+local historyBackBtn = btn(liveHistoryScreen, {Size=UDim2.new(1,0,0,26), BackgroundColor3=theme.buttonBg, Text="< Back to list", TextSize=13})
+local historyTitle = make("TextLabel", {Size=UDim2.new(1,0,0,18), Position=UDim2.new(0,0,0,30), BackgroundTransparency=1, Text="", TextColor3=theme.text, Font=Enum.Font.GothamBold, TextSize=13, TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd}, liveHistoryScreen)
+local historyScroll = make("ScrollingFrame", {Size=UDim2.new(1,0,1,-52), Position=UDim2.new(0,0,0,52), BackgroundTransparency=1, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=6}, liveHistoryScreen)
+make("UIListLayout", {Padding=UDim.new(0,2)}, historyScroll)
+
+local liveEditScreen = make("ScrollingFrame", {Size=UDim2.new(1,0,1,-32), Position=UDim2.new(0,0,0,32), BackgroundTransparency=1, Visible=false, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=6}, livePage)
+make("UIListLayout", {Padding=UDim.new(0,6)}, liveEditScreen)
+local editBackBtn = btn(liveEditScreen, {Size=UDim2.new(1,0,0,26), BackgroundColor3=theme.buttonBg, Text="< Back to history", TextSize=13})
+local editTitle = make("TextLabel", {Size=UDim2.new(1,0,0,18), BackgroundTransparency=1, Text="", TextColor3=theme.text, Font=Enum.Font.GothamBold, TextSize=13, TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd}, liveEditScreen)
+local editFieldsHolder = make("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1}, liveEditScreen)
+make("UIListLayout", {Padding=UDim.new(0,4)}, editFieldsHolder)
+local fireEditedBtn = btn(liveEditScreen, {Size=UDim2.new(1,0,0,32), BackgroundColor3=theme.accent, Text="Fire With These Values", Font=Enum.Font.GothamBold, TextSize=14})
+
+local currentDirection = "Outgoing"
+local currentRemote = nil
+local liveRowsByRemote = {} -- [direction][remote] = row instance, so counts can update live
+
+for d, _ in pairs(logs) do liveRowsByRemote[d] = {} end
+
+local function showLiveScreen(which)
+    liveListScreen.Visible = (which == "list")
+    liveHistoryScreen.Visible = (which == "history")
+    liveEditScreen.Visible = (which == "edit")
+end
+
+local function refreshLiveList()
+    for _, c in ipairs(liveListScreen:GetChildren()) do
+        if c:IsA("Frame") or c:IsA("TextButton") then c:Destroy() end
+    end
+    liveRowsByRemote[currentDirection] = {}
+
+    local bucket = logs[currentDirection]
+    -- stable order: sort by most recent call time isn't trivial without storing a sortable timestamp;
+    -- iterate pairs() order (insertion order isn't guaranteed in Lua tables, but is acceptable here
+    -- since this is a live debug tool, not something requiring strict ordering)
+    for remote, entry in pairs(bucket) do
+        local row = make("TextButton", {Size=UDim2.new(1,0,0,30), BackgroundColor3=theme.card, Text="", AutoButtonColor=false}, liveListScreen)
+        corner(row, 5)
+        make("TextLabel", {Size=UDim2.new(0,24,1,0), BackgroundTransparency=1, Text=CLASS_ICON[remote.ClassName] or "?", TextColor3=theme.accent, Font=Enum.Font.GothamBold, TextSize=15}, row)
+        make("TextLabel", {Size=UDim2.new(1,-70,1,0), Position=UDim2.new(0,26,0,0), BackgroundTransparency=1, Text=remote.Name, TextColor3=theme.text, Font=Enum.Font.GothamBold, TextSize=13, TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd}, row)
+        local countLabel = make("TextLabel", {Size=UDim2.new(0,40,1,0), Position=UDim2.new(1,-44,0,0), BackgroundTransparency=1, Text="x"..entry.count, TextColor3=theme.accent, Font=Enum.Font.GothamBold, TextSize=13}, row)
+        row:SetAttribute("CountLabelRef", true)
+        liveRowsByRemote[currentDirection][remote] = {row = row, countLabel = countLabel}
+
+        row.MouseButton1Click:Connect(function()
+            currentRemote = remote
+            historyTitle.Text = remote.ClassName .. ": " .. remote:GetFullName()
+            showLiveScreen("history")
+        end)
+    end
+end
+
+local function openEditForCall(remote, call)
+    for _, c in ipairs(editFieldsHolder:GetChildren()) do c:Destroy() end
+    editTitle.Text = remote.ClassName .. ": " .. remote.Name .. "  (" .. call.time .. ", " .. call.script .. ")"
+
+    local fieldBoxes = {}
+    for i, arg in ipairs(call.args) do
+        local row = make("Frame", {Size=UDim2.new(1,0,0,40), BackgroundTransparency=1}, editFieldsHolder)
+        make("TextLabel", {Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Text="Arg "..i.." ("..arg.typeLabel..")", TextColor3=TYPE_COLORS[arg.typeLabel] or theme.text, Font=Enum.Font.Gotham, TextSize=11, TextXAlignment=Enum.TextXAlignment.Left}, row)
+                local box = make("TextBox", {
+            Size = UDim2.new(1, 0, 0, 24),
+            Position = UDim2.new(0, 0, 0, 16),
+            BackgroundColor3 = theme.buttonBg,
+            TextColor3 = theme.text,
+            Text = arg.display,
+            ClearTextOnFocus = false,
+            Font = Enum.Font.Gotham,
+            TextSize = 12
+        }, row)
+        
+        fieldBoxes[i] = {box = box, typeLabel = arg.typeLabel}
+    end
+
+    -- Hook up the fire button to parse fields and invoke/fire the remote
+    local connection
+    connection = fireEditedBtn.MouseButton1Click:Connect(function()
+        if not currentRemote then return end
+        local parsedArgs = {}
+        for i, field in ipairs(fieldBoxes) do
+            parsedArgs[i] = parseValue(field.box.Text, field.typeLabel)
+        end
+        fireRemote(currentRemote, parsedArgs)
+    end)
+    
+    -- Cleanup connection when backing out
+    local backConnection
+    backConnection = editBackBtn.MouseButton1Click:Connect(function()
+        connection:Disconnect()
+        backConnection:Disconnect()
+        showLiveScreen("history")
+    end)
+end
